@@ -1,3 +1,4 @@
+use core::sync::atomic::fence;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 use std::sync::Arc;
@@ -26,7 +27,6 @@ pub struct SpmcQueueProducer<T> {
     inner: Arc<SpmcQueueInner<T>>,
 }
 
-#[derive(Clone)]
 pub struct SpmcQueueConsumer<T> {
     inner: Arc<SpmcQueueInner<T>>,
 }
@@ -60,7 +60,7 @@ impl<T> SpmcQueueProducer<T> {
         let head = inner.head.load(Acquire);
         let tail = inner.tail.load(Acquire);
         let capacity = inner.capacity;
-        if tail.wrapping_sub(head) >= capacity {
+        if tail.wrapping_sub(head) == capacity {
             return false;
         }
         let idx = tail % capacity;
@@ -68,10 +68,17 @@ impl<T> SpmcQueueProducer<T> {
         unsafe {
             core::ptr::write(contents.add(idx), item);
         }
+        fence(Release);
         inner.tail.store(tail.wrapping_add(1), Release);
         true
     }
     pub fn to_consumer(&self) -> SpmcQueueConsumer<T> {
+        SpmcQueueConsumer::new(self.inner.clone())
+    }
+}
+
+impl<T> Clone for SpmcQueueConsumer<T> {
+    fn clone(&self) -> SpmcQueueConsumer<T> {
         SpmcQueueConsumer::new(self.inner.clone())
     }
 }
@@ -92,6 +99,7 @@ impl<T> SpmcQueueConsumer<T> {
             }
             let idx = head % capacity;
             let contents = inner.contents.as_ptr();
+            fence(Acquire);
             let result = unsafe { core::ptr::read(contents.add(idx)) };
             match inner
                 .head
@@ -117,47 +125,52 @@ mod tests {
     use crate::spmc_new;
     use core::sync::atomic::AtomicUsize;
     use core::sync::atomic::Ordering::Relaxed;
-    #[derive(Debug, PartialEq)]
-    struct DropTest(i32);
-    static DROP_TEST_COUNT: AtomicUsize = AtomicUsize::new(0);
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct DropTest(Arc<AtomicUsize>);
     impl Drop for DropTest {
         fn drop(&mut self) {
-            DROP_TEST_COUNT.fetch_sub(1, Relaxed);
+            self.0.fetch_sub(1, Relaxed);
         }
     }
     impl DropTest {
-        fn new() -> Self {
-            DROP_TEST_COUNT.fetch_add(1, Relaxed);
-            DropTest(0)
+        fn new(inner: &Arc<AtomicUsize>) -> Self {
+            let i = inner.clone();
+            i.fetch_add(1, Relaxed);
+            DropTest(i)
         }
     }
     #[test]
     fn single_thread_usize() {
+        let n = 128;
         let (mut p, c) = spmc_new(128);
 
         assert_eq!(c.size(), 0);
         assert!(p.enqueue(5));
         assert_eq!(c.size(), 1);
         assert_eq!(c.dequeue(), Some(5));
-        assert_eq!(c.dequeue(), None);
+        assert_eq!(c.size(), 0);
+        assert!(c.dequeue().is_none());
 
-        assert!(p.enqueue(1));
-        assert!(p.enqueue(2));
-        assert!(p.enqueue(3));
-        assert_eq!(c.size(), 3);
-        assert_eq!(c.dequeue(), Some(1));
-        assert_eq!(c.dequeue(), Some(2));
-        assert_eq!(c.dequeue(), Some(3));
-        assert_eq!(c.dequeue(), None);
+        for i in 0..n {
+            assert!(p.enqueue(i));
+            assert_eq!(c.size(), i + 1);
+        }
 
         let d = c.clone();
-        assert!(p.enqueue(1));
-        assert!(p.enqueue(2));
-        assert_eq!(d.size(), c.size());
-        assert_eq!(d.dequeue(), Some(1));
-        assert_eq!(d.size(), c.size());
-        assert_eq!(c.dequeue(), Some(2));
-        assert_eq!(d.size(), c.size());
+
+        for i in 0..n {
+            assert_eq!(c.size(), n - i);
+            assert_eq!(d.size(), n - i);
+            if i < n / 2 {
+                assert_eq!(c.dequeue(), Some(i));
+            } else {
+                assert_eq!(d.dequeue(), Some(i));
+            }
+        }
+        assert!(c.dequeue().is_none());
+        assert!(d.dequeue().is_none());
     }
 
     #[test]
@@ -165,50 +178,63 @@ mod tests {
         let (mut p, c) = spmc_new(128);
         assert!(p.enqueue(Box::new(5)));
         assert_eq!(c.dequeue(), Some(Box::new(5)));
-        assert_eq!(c.dequeue(), None);
+        assert!(c.dequeue().is_none());
         let c2 = p.to_consumer();
         assert!(p.enqueue(Box::new(42)));
         assert_eq!(c2.dequeue(), Some(Box::new(42)));
-        assert_eq!(c2.dequeue(), None);
+        assert!(c.dequeue().is_none());
+    }
+
+    #[test]
+    fn no_consumers_test() {
+        let ctr = Arc::new(AtomicUsize::new(0));
+        let (mut p, _) = spmc_new(64);
+        for i in 0..64 {
+            assert!(p.enqueue(DropTest::new(&ctr)));
+            assert_eq!(ctr.load(Relaxed), i + 1);
+        }
+        assert!(!p.enqueue(DropTest::new(&ctr)));
+        core::mem::drop(p);
+        assert_eq!(ctr.load(Relaxed), 0);
     }
 
     #[test]
     fn single_thread_drop_test() {
+        let ctr = Arc::new(AtomicUsize::new(0));
         let (mut p, c) = spmc_new(128);
-        assert!(p.enqueue(DropTest::new()));
-        assert_eq!(c.dequeue(), Some(DropTest::new()));
-        assert_eq!(c.dequeue(), None);
-        assert!(p.enqueue(DropTest::new()));
-
+        assert!(p.enqueue(DropTest::new(&ctr)));
+        c.dequeue().unwrap();
+        assert!(c.dequeue().is_none());
         core::mem::drop(p);
         core::mem::drop(c);
-        assert_eq!(DROP_TEST_COUNT.load(Relaxed), 0);
+        assert_eq!(ctr.load(Relaxed), 0);
     }
 
     #[test]
     fn multi_thread_box() {
-        let (mut p, c) = spmc_new(128);
+        let ctr = Arc::new(AtomicUsize::new(0));
+        let n = 128;
+        let (mut p, c) = spmc_new(n);
         let mut consumers = Vec::new();
-        for _i in 1..3 {
+        for _ in 0..n {
             let consumer = c.clone();
             consumers.push(std::thread::spawn(move || loop {
                 match consumer.dequeue() {
-                    Some(x) => {
-                        assert_eq!(x, Box::new(5));
+                    Some(_) => {
                         return;
                     }
-                    None => continue,
+                    None => core::hint::spin_loop(),
                 }
             }));
         }
-        for _i in 1..3 {
-            assert!(p.enqueue(Box::new(5)));
+        for _ in 0..n {
+            assert!(p.enqueue(DropTest::new(&ctr)));
         }
         for handle in consumers {
-            match handle.join() {
-                Ok(_) => continue,
-                Err(x) => panic!("thread join failed {:?}", x),
-            }
+            handle.join().unwrap();
         }
+        core::mem::drop(p);
+        core::mem::drop(c);
+        assert_eq!(ctr.load(Relaxed), 0);
     }
 }
