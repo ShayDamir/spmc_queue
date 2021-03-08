@@ -212,29 +212,44 @@ mod tests {
 
     #[test]
     fn multi_thread_box() {
-        let ctr = Arc::new(AtomicUsize::new(0));
-        let n = 128;
-        let (mut p, c) = spmc_new(n);
+        let recv_ctr = Arc::new(AtomicUsize::new(0));
+        let n = 1024 * 1024;
+        let nthreads = 3;
+        let (mut p, c) = spmc_new(128);
         let mut consumers = Vec::new();
-        for _ in 0..n {
+        for _ in 0..nthreads {
             let consumer = c.clone();
-            consumers.push(std::thread::spawn(move || loop {
-                match consumer.dequeue() {
-                    Some(_) => {
-                        return;
+            let r_ctr = recv_ctr.clone();
+            consumers.push(std::thread::spawn(move || {
+                while r_ctr.load(Relaxed) < n {
+                    match consumer.dequeue() {
+                        Some(_) => {
+                            r_ctr.fetch_add(1, Relaxed);
+                        }
+                        None => {
+                            std::thread::yield_now();
+                        }
                     }
-                    None => core::hint::spin_loop(),
                 }
             }));
         }
-        for _ in 0..n {
-            assert!(p.enqueue(DropTest::new(&ctr)));
-        }
-        for handle in consumers {
+        core::mem::drop(c);
+        let drop_ctr = Arc::new(AtomicUsize::new(0));
+        let producer_ctr = drop_ctr.clone();
+        let producer_handle = std::thread::spawn(move || {
+            let mut i = 0;
+            while i < n {
+                match p.enqueue(DropTest::new(&producer_ctr)) {
+                    false => std::thread::yield_now(),
+                    true => i += 1,
+                };
+            }
+        });
+        for handle in consumers.into_iter() {
             handle.join().unwrap();
         }
-        core::mem::drop(p);
-        core::mem::drop(c);
-        assert_eq!(ctr.load(Relaxed), 0);
+        producer_handle.join().unwrap();
+        assert_eq!(drop_ctr.load(Relaxed), 0);
+        assert_eq!(recv_ctr.load(Relaxed), n);
     }
 }
