@@ -7,7 +7,6 @@ struct SpmcQueueInner<T> {
     contents: Vec<T>,
     head: AtomicUsize,
     tail: AtomicUsize,
-    capacity: usize,
 }
 
 impl<T> Drop for SpmcQueueInner<T> {
@@ -16,7 +15,7 @@ impl<T> Drop for SpmcQueueInner<T> {
         let tail = self.tail.load(Acquire);
         let contents = self.contents.as_mut_ptr();
         while head != tail {
-            let idx = head % self.capacity;
+            let idx = head % self.contents.capacity();
             unsafe { core::ptr::drop_in_place(contents.add(idx)) };
             head = head.wrapping_add(1);
         }
@@ -39,7 +38,6 @@ pub fn spmc_new<T>(capacity: usize) -> (SpmcQueueProducer<T>, SpmcQueueConsumer<
     let inner = SpmcQueueInner {
         head: AtomicUsize::new(usize::MAX),
         tail: AtomicUsize::new(usize::MAX),
-        capacity,
         contents: Vec::with_capacity(capacity),
     };
     assert!(capacity != 0);
@@ -59,11 +57,10 @@ impl<T> SpmcQueueProducer<T> {
         let inner = &self.inner;
         let head = inner.head.load(Acquire);
         let tail = inner.tail.load(Acquire);
-        let capacity = inner.capacity;
-        if tail.wrapping_sub(head) == capacity {
+        if tail.wrapping_sub(head) == inner.contents.capacity() {
             return false;
         }
-        let idx = tail % capacity;
+        let idx = tail % inner.contents.capacity();
         let contents = inner.contents.as_ptr() as *mut T;
         unsafe {
             core::ptr::write(contents.add(idx), item);
@@ -90,14 +87,13 @@ impl<T> SpmcQueueConsumer<T> {
     pub fn dequeue(&self) -> Option<T> {
         let inner = &self.inner;
         let mut head = inner.head.load(Acquire);
-        let capacity = inner.capacity;
 
         loop {
             let tail = inner.tail.load(Acquire);
             if tail == head {
                 return None;
             }
-            let idx = head % capacity;
+            let idx = head % inner.contents.capacity();
             let contents = inner.contents.as_ptr();
             fence(Acquire);
             let result = unsafe { core::ptr::read(contents.add(idx)) };
