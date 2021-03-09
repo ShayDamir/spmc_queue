@@ -84,6 +84,30 @@ impl<T> SpmcQueueConsumer<T> {
     fn new(inner: Arc<SpmcQueueInner<T>>) -> Self {
         Self { inner }
     }
+
+    #[inline]
+    fn load(&self, head: usize) -> T {
+        let idx = head % self.inner.contents.capacity();
+        let contents = self.inner.contents.as_ptr();
+        fence(Acquire);
+        unsafe { core::ptr::read(contents.add(idx)) }
+    }
+
+    #[inline]
+    fn confirm(&self, head: usize, result: T) -> Result<T, usize> {
+        match self
+            .inner
+            .head
+            .compare_exchange(head, head.wrapping_add(1), AcqRel, Acquire)
+        {
+            Ok(_) => Ok(result),
+            Err(x) => {
+                core::mem::forget(result);
+                Err(x)
+            }
+        }
+    }
+
     pub fn dequeue(&self) -> Option<T> {
         let inner = &self.inner;
         let mut head = inner.head.load(Acquire);
@@ -93,19 +117,10 @@ impl<T> SpmcQueueConsumer<T> {
             if tail == head {
                 return None;
             }
-            let idx = head % inner.contents.capacity();
-            let contents = inner.contents.as_ptr();
-            fence(Acquire);
-            let result = unsafe { core::ptr::read(contents.add(idx)) };
-            match inner
-                .head
-                .compare_exchange_weak(head, head.wrapping_add(1), AcqRel, Acquire)
-            {
-                Ok(_) => return Some(result),
-                Err(x) => {
-                    core::mem::forget(result);
-                    head = x;
-                }
+            let result = self.load(head);
+            match self.confirm(head, result) {
+                Ok(x) => return Some(x),
+                Err(h) => head = h,
             }
         }
     }
@@ -203,6 +218,36 @@ mod tests {
         assert!(c.dequeue().is_none());
         core::mem::drop(p);
         core::mem::drop(c);
+        assert_eq!(ctr.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn race_condition_check() {
+        let (mut p, c1) = spmc_new(128);
+        let c2 = c1.clone();
+        let c3 = p.to_consumer();
+
+        let ctr = Arc::new(AtomicUsize::new(0));
+        assert!(p.enqueue(DropTest::new(&ctr)));
+        let head = p.inner.head.load(Relaxed);
+
+        /* Simulate race condition, when 3 different
+         * consumers load the same value, then try to confirm it.
+         * Only one should succeed */
+        let r1 = c1.load(head);
+        let r2 = c2.load(head);
+        let r3 = c3.load(head);
+
+        let con1 = c1.confirm(head, r1);
+        let con2 = c2.confirm(head, r2);
+        let con3 = c3.confirm(head, r3);
+
+        /* only first confirmation succeeds */
+        assert!(con1.is_ok());
+        con1.unwrap();
+        assert_eq!(con2.err(), Some(head.wrapping_add(1)));
+        assert_eq!(con3.err(), Some(head.wrapping_add(1)));
+
         assert_eq!(ctr.load(Relaxed), 0);
     }
 
