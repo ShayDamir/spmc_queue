@@ -1,0 +1,11 @@
+[tasks.criterion]
+command = "cargo"
+args = ["criterion"]
+
+[tasks.check]
+# Runs before commit
+dependencies = [
+	"dev-test-flow",
+	"coverage-flow",
+	"criterion"
+]
