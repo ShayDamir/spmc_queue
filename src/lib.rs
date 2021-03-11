@@ -1,6 +1,7 @@
+use core::fmt;
 use core::sync::atomic::fence;
 use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::Arc;
 
 struct SpmcQueueInner<T> {
@@ -34,7 +35,61 @@ unsafe impl<T: Send> Send for SpmcQueue<T> {}
 unsafe impl<T: Send> Send for SpmcQueueConsumer<T> {}
 unsafe impl<T: Send> Sync for SpmcQueueConsumer<T> {}
 
+impl<T> Default for SpmcQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> fmt::Display for SpmcQueue<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "SpmcQueue({} out of {})", self.size(), self.capacity())
+    }
+}
+
+impl<T> fmt::Debug for SpmcQueue<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("SpmcQueue")
+            .field("head", &self.inner.head.load(Relaxed))
+            .field("tail", &self.inner.tail.load(Relaxed))
+            .field("consumers", &(Arc::strong_count(&self.inner) - 1))
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+impl<T> fmt::Display for SpmcQueueConsumer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "SpmcQueueConsumer({} out of {})",
+            self.size(),
+            self.capacity()
+        )
+    }
+}
+
+impl<T> fmt::Debug for SpmcQueueConsumer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("SpmcQueueConsumer")
+            .field("head", &self.inner.head.load(Relaxed))
+            .field("tail", &self.inner.tail.load(Relaxed))
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+impl<T> From<SpmcQueue<T>> for SpmcQueueConsumer<T> {
+    fn from(p: SpmcQueue<T>) -> Self {
+        Self { inner: p.inner }
+    }
+}
+
 impl<T> SpmcQueue<T> {
+    pub fn new() -> Self {
+        Self::with_capacity(1024)
+    }
+
     pub fn with_capacity(capacity: usize) -> Self {
         let inner = Arc::new(SpmcQueueInner {
             head: AtomicUsize::new(usize::MAX),
@@ -46,7 +101,7 @@ impl<T> SpmcQueue<T> {
         Self { inner }
     }
 
-    pub fn enqueue(&mut self, item: T) -> bool {
+    pub fn push(&mut self, item: T) -> bool {
         let inner = &self.inner;
         let head = inner.head.load(Acquire);
         let tail = inner.tail.load(Acquire);
@@ -63,12 +118,18 @@ impl<T> SpmcQueue<T> {
         true
     }
 
-    pub fn add_consumer(&self) -> SpmcQueueConsumer<T> {
+    pub fn to_consumer(&self) -> SpmcQueueConsumer<T> {
         SpmcQueueConsumer::new(self.inner.clone())
     }
 
     pub fn capacity(&self) -> usize {
         self.inner.contents.capacity()
+    }
+
+    pub fn size(&self) -> usize {
+        let head = self.inner.head.load(Acquire);
+        let tail = self.inner.tail.load(Acquire);
+        tail.wrapping_sub(head)
     }
 }
 
@@ -106,7 +167,7 @@ impl<T> SpmcQueueConsumer<T> {
         }
     }
 
-    pub fn dequeue(&self) -> Option<T> {
+    pub fn pop(&self) -> Option<T> {
         let inner = &self.inner;
         let mut head = inner.head.load(Acquire);
 
@@ -136,7 +197,7 @@ impl<T> SpmcQueueConsumer<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::SpmcQueue;
+    use crate::{SpmcQueue, SpmcQueueConsumer};
     use core::sync::atomic::AtomicUsize;
     use core::sync::atomic::Ordering::Relaxed;
     use std::sync::Arc;
@@ -156,21 +217,36 @@ mod tests {
             DropTest(i)
         }
     }
+
+    #[test]
+    fn example_test() {
+        let mut p = SpmcQueue::default();
+        let c = p.to_consumer();
+        for i in 0..10 {
+            p.push(i);
+        }
+        let mut r = 0;
+        while let Some(i) = c.pop() {
+            assert_eq!(r, i);
+            r += 1;
+        }
+    }
+
     #[test]
     fn single_thread_usize() {
         let n = 128;
         let mut p = SpmcQueue::with_capacity(128);
-        let c = p.add_consumer();
+        let c = p.to_consumer();
 
         assert_eq!(c.size(), 0);
-        assert!(p.enqueue(5));
+        assert!(p.push(5));
         assert_eq!(c.size(), 1);
-        assert_eq!(c.dequeue(), Some(5));
+        assert_eq!(c.pop(), Some(5));
         assert_eq!(c.size(), 0);
-        assert!(c.dequeue().is_none());
+        assert!(c.pop().is_none());
 
         for i in 0..n {
-            assert!(p.enqueue(i));
+            assert!(p.push(i));
             assert_eq!(c.size(), i + 1);
         }
 
@@ -180,13 +256,13 @@ mod tests {
             assert_eq!(c.size(), n - i);
             assert_eq!(d.size(), n - i);
             if i < n / 2 {
-                assert_eq!(c.dequeue(), Some(i));
+                assert_eq!(c.pop(), Some(i));
             } else {
-                assert_eq!(d.dequeue(), Some(i));
+                assert_eq!(d.pop(), Some(i));
             }
         }
-        assert!(c.dequeue().is_none());
-        assert!(d.dequeue().is_none());
+        assert!(c.pop().is_none());
+        assert!(d.pop().is_none());
         assert_eq!(c.capacity(), n);
         assert_eq!(d.capacity(), n);
         assert_eq!(p.capacity(), n);
@@ -194,38 +270,58 @@ mod tests {
 
     #[test]
     fn single_thread_box() {
-        let mut p = SpmcQueue::with_capacity(128);
-        let c = p.add_consumer();
-        assert!(p.enqueue(Box::new(5)));
-        assert_eq!(c.dequeue(), Some(Box::new(5)));
-        assert!(c.dequeue().is_none());
+        let mut p = SpmcQueue::new();
+        let c = p.to_consumer();
+        assert!(p.push(Box::new(5)));
+        assert_eq!(c.pop(), Some(Box::new(5)));
+        assert!(c.pop().is_none());
         let c2 = c.clone();
-        assert!(p.enqueue(Box::new(42)));
-        assert_eq!(c2.dequeue(), Some(Box::new(42)));
-        assert!(c.dequeue().is_none());
+        assert!(p.push(Box::new(42)));
+        assert_eq!(c2.pop(), Some(Box::new(42)));
+        assert!(c.pop().is_none());
     }
 
     #[test]
     fn no_consumers_test() {
         let ctr = Arc::new(AtomicUsize::new(0));
-        let mut p = SpmcQueue::with_capacity(64);
+        let mut p = SpmcQueue::default();
         for i in 0..p.capacity() {
-            assert!(p.enqueue(DropTest::new(&ctr)));
+            assert!(p.push(DropTest::new(&ctr)));
             assert_eq!(ctr.load(Relaxed), i + 1);
         }
-        assert!(!p.enqueue(DropTest::new(&ctr)));
+        assert!(!p.push(DropTest::new(&ctr)));
         core::mem::drop(p);
         assert_eq!(ctr.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn fmt_test() {
+        let p: SpmcQueue<usize> = SpmcQueue::with_capacity(64);
+        let c = p.to_consumer();
+        println!("Display: {} {}", p, c);
+        println!("Debug: {:?} {:?}", p, c);
+    }
+
+    #[test]
+    fn test_to_consumer() {
+        let p: SpmcQueue<usize> = SpmcQueue::with_capacity(64);
+        let c1 = p.to_consumer();
+        let c2 = c1.clone();
+        assert_eq!(c1.capacity(), p.capacity());
+        assert_eq!(c1.capacity(), c2.capacity());
+        /* this consumes the queue */
+        let c3 = SpmcQueueConsumer::from(p);
+        assert_eq!(c1.capacity(), c3.capacity());
     }
 
     #[test]
     fn single_thread_drop_test() {
         let ctr = Arc::new(AtomicUsize::new(0));
         let mut p = SpmcQueue::with_capacity(128);
-        let c = p.add_consumer();
-        assert!(p.enqueue(DropTest::new(&ctr)));
-        c.dequeue().unwrap();
-        assert!(c.dequeue().is_none());
+        let c = p.to_consumer();
+        assert!(p.push(DropTest::new(&ctr)));
+        c.pop().unwrap();
+        assert!(c.pop().is_none());
         core::mem::drop(p);
         core::mem::drop(c);
         assert_eq!(ctr.load(Relaxed), 0);
@@ -234,11 +330,11 @@ mod tests {
     #[test]
     fn race_condition_check() {
         let mut p = SpmcQueue::with_capacity(128);
-        let c1 = p.add_consumer();
+        let c1 = p.to_consumer();
         let c2 = c1.clone();
 
         let ctr = Arc::new(AtomicUsize::new(0));
-        assert!(p.enqueue(DropTest::new(&ctr)));
+        assert!(p.push(DropTest::new(&ctr)));
         let head = p.inner.head.load(Relaxed);
 
         /* Simulate race condition, when 2 different
@@ -266,11 +362,11 @@ mod tests {
         let mut p = SpmcQueue::with_capacity(128);
         let mut consumers = Vec::new();
         for _ in 0..nthreads {
-            let consumer = p.add_consumer();
+            let consumer = p.to_consumer();
             let r_ctr = recv_ctr.clone();
             consumers.push(thread::spawn(move || {
                 while r_ctr.load(Relaxed) < n {
-                    match consumer.dequeue() {
+                    match consumer.pop() {
                         Some(_) => {
                             r_ctr.fetch_add(1, Relaxed);
                         }
@@ -286,7 +382,7 @@ mod tests {
         let producer_handle = thread::spawn(move || {
             let mut i = 0;
             while i < n {
-                match p.enqueue(DropTest::new(&producer_ctr)) {
+                match p.push(DropTest::new(&producer_ctr)) {
                     false => std::thread::yield_now(),
                     true => i += 1,
                 };
