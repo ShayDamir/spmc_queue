@@ -1,3 +1,52 @@
+#![deny(warnings)]
+#![warn(missing_docs)]
+
+//! # SPMC Queue
+//!
+//! Single Producer, Multiple Consumer Bound Lock-free Queue. Can be used to
+//! efficiently implement work-stealing algorithms with polling.
+//!
+//! The queue is bound and non-blocking. It can contain fixed number of elements,
+//! and  the [`SpmcQueue::push()`] operation will fail if the queue is full, and [`SpmcQueue::pop()`] will
+//! fail if the queue is empty.
+//!
+//! Waiting can be implemented by external methods, or a polling method can be
+//! used by checking for [`SpmcQueue::is_full()`] or [`SpmcQueue::is_empty()`].
+//!
+//! ## Forward guarantees
+//!
+//! `push()` operation is wait-free, i.e. it will be complete in a fixed amount of time.
+//! `pop()` operation is lock-free, i.e. out of multiple concurrent `pop()` operations,
+//!  at least one will succeed. Others will retry the operations until they succeed.
+//!
+//! ## Example
+//!
+//! ```
+//! # use std::thread;
+//! use spmc_queue::SpmcQueue;
+//! let mut queue = SpmcQueue::new();
+//! let mut handles = Vec::new();
+//!
+//! for t in 0..10 {
+//!     let c = queue.to_consumer();
+//!     handles.push(thread::spawn(move || {
+//!         loop {
+//!            match c.pop() {
+//!             Some(element) => { println!("Consumer {} got {}", t, element); break; }
+//!             None => { thread::yield_now(); }
+//!            }
+//!         }
+//!     }));
+//! }
+//!
+//! for i in 0..10 {
+//!     queue.push(i).unwrap();
+//! }
+//! for h in handles {
+//!    h.join().unwrap();
+//! }
+//! ```
+
 use core::fmt;
 use core::sync::atomic::fence;
 use core::sync::atomic::AtomicUsize;
@@ -23,10 +72,114 @@ impl<T> Drop for SpmcQueueInner<T> {
     }
 }
 
+impl<T> SpmcQueueInner<T> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            head: AtomicUsize::new(usize::MAX),
+            tail: AtomicUsize::new(usize::MAX),
+            contents: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&self, item: T) -> Result<(), T> {
+        let head = self.head.load(Acquire);
+        let tail = self.tail.load(Acquire);
+        if tail.wrapping_sub(head) == self.contents.capacity() {
+            return Err(item);
+        }
+        let idx = tail % self.contents.capacity();
+        let contents = self.contents.as_ptr() as *mut T;
+        unsafe {
+            core::ptr::write(contents.add(idx), item);
+        }
+        fence(Release);
+        self.tail.store(tail.wrapping_add(1), Release);
+        Ok(())
+    }
+
+    #[inline]
+    fn load(&self, head: usize) -> T {
+        let idx = head % self.contents.capacity();
+        let contents = self.contents.as_ptr();
+        fence(Acquire);
+        unsafe { core::ptr::read(contents.add(idx)) }
+    }
+
+    #[inline]
+    fn confirm(&self, head: usize, result: T) -> Result<T, usize> {
+        match self
+            .head
+            .compare_exchange(head, head.wrapping_add(1), AcqRel, Acquire)
+        {
+            Ok(_) => Ok(result),
+            Err(x) => {
+                core::mem::forget(result);
+                Err(x)
+            }
+        }
+    }
+
+    fn pop(&self) -> Option<T> {
+        let mut head = self.head.load(Acquire);
+
+        loop {
+            let tail = self.tail.load(Acquire);
+            if tail == head {
+                return None;
+            }
+            let result = self.load(head);
+            match self.confirm(head, result) {
+                Ok(x) => return Some(x),
+                Err(h) => head = h,
+            }
+        }
+    }
+
+    fn size(&self) -> usize {
+        let head = self.head.load(Acquire);
+        let tail = self.tail.load(Acquire);
+        tail.wrapping_sub(head)
+    }
+
+    fn capacity(&self) -> usize {
+        self.contents.capacity()
+    }
+
+    fn is_full(&self) -> bool {
+        self.size() == self.capacity()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.size() == 0
+    }
+}
+
+/// Queue producer structure used for pushing elements into the queue
+///
+/// There can be only one producer. It cannot be cloned, but it can be moved
+/// to another thread.
 pub struct SpmcQueue<T> {
     inner: Arc<SpmcQueueInner<T>>,
 }
 
+/// Queue consumer structure, used only for popping elements from the queue
+///
+/// This can be constructed from an existing SpmcQueue by calling
+/// [`SpmcQueue::to_consumer()`], or by cloning an existing consumer.
+///
+/// ## Example:
+/// ```
+/// # use spmc_queue::SpmcQueue;
+/// let mut queue = SpmcQueue::new();
+/// let c1 = queue.to_consumer();
+/// let c2 = c1.clone();
+///
+/// queue.push(1).unwrap();
+/// queue.push(2).unwrap();
+///
+/// assert_eq!(c1.pop().unwrap(), 1);
+/// assert_eq!(c2.pop().unwrap(), 2);
+/// ```
 pub struct SpmcQueueConsumer<T> {
     inner: Arc<SpmcQueueInner<T>>,
 }
@@ -86,50 +239,107 @@ impl<T> From<SpmcQueue<T>> for SpmcQueueConsumer<T> {
 }
 
 impl<T> SpmcQueue<T> {
+    /// Creates a new empty queue with capacity of 1024 elements.
     pub fn new() -> Self {
         Self::with_capacity(1024)
     }
 
+    /// Creates a new empty queue with defined `capacity`
+    ///
+    /// The capacity must be a power of 2 for the queue to operate properly.
+    ///
+    /// ## Panics
+    /// Panics if capacity is not a power of 2.
     pub fn with_capacity(capacity: usize) -> Self {
-        let inner = Arc::new(SpmcQueueInner {
-            head: AtomicUsize::new(usize::MAX),
-            tail: AtomicUsize::new(usize::MAX),
-            contents: Vec::with_capacity(capacity),
-        });
         assert!(capacity != 0);
         assert!(capacity & (capacity - 1) == 0);
-        Self { inner }
+        Self {
+            inner: Arc::new(SpmcQueueInner::with_capacity(capacity)),
+        }
     }
 
-    pub fn push(&mut self, item: T) -> bool {
-        let inner = &self.inner;
-        let head = inner.head.load(Acquire);
-        let tail = inner.tail.load(Acquire);
-        if tail.wrapping_sub(head) == inner.contents.capacity() {
-            return false;
-        }
-        let idx = tail % inner.contents.capacity();
-        let contents = inner.contents.as_ptr() as *mut T;
-        unsafe {
-            core::ptr::write(contents.add(idx), item);
-        }
-        fence(Release);
-        inner.tail.store(tail.wrapping_add(1), Release);
-        true
+    /// Pushes an element to the tail of the queue
+    ///
+    /// On success, the item is moved into the queue. On failure, the item is
+    /// returned back, wrapped in an `Err`.
+    ///
+    /// Returns `Ok(())` on success, and `Err(item)` on failure.
+    ///
+    /// This operation is wait-free.
+    ///
+    /// ## Example:
+    /// ```
+    /// # use spmc_queue::SpmcQueue;
+    /// let mut queue = SpmcQueue::with_capacity(2);
+    /// assert!(queue.push(1).is_ok());
+    /// assert!(queue.push(2).is_ok());
+    /// let result = queue.push(3);
+    /// assert_eq!(result, Err(3));
+    /// ```
+    pub fn push(&mut self, item: T) -> Result<(), T> {
+        self.inner.push(item)
     }
 
+    /// Pops an element from the head of the queue
+    ///
+    /// This operation is lock-free.
+    ///
+    /// ## Example:
+    ///
+    /// ```
+    /// # use spmc_queue::SpmcQueue;
+    /// let mut queue = SpmcQueue::new();
+    /// queue.push(1).unwrap();
+    /// queue.push(2).unwrap();
+    /// assert_eq!(queue.pop(), Some(1));
+    /// assert_eq!(queue.pop(), Some(2));
+    /// assert_eq!(queue.pop(), None);
+    /// ```
+    pub fn pop(&self) -> Option<T> {
+        self.inner.pop()
+    }
+
+    /// Creates a new consumer for the Queue
+    ///
+    /// A consumer can only [`SpmcQueueConsumer::pop()`] from the queue, but it
+    /// can be cloned and sent to different threads of execution.
+    ///
+    /// ## Example:
+    /// ```
+    /// # use spmc_queue::SpmcQueue;
+    /// let mut queue = SpmcQueue::new();
+    /// let c1 = queue.to_consumer();
+    /// let c2 = c1.clone();
+    ///
+    /// queue.push(1).unwrap();
+    /// queue.push(2).unwrap();
+    ///
+    /// assert_eq!(c1.pop(), Some(1));
+    /// assert_eq!(c2.pop(), Some(2));
+    /// assert_eq!(c1.pop(), None);
+    /// ```
     pub fn to_consumer(&self) -> SpmcQueueConsumer<T> {
         SpmcQueueConsumer::new(self.inner.clone())
     }
 
+    /// returns maximum number of elements the queue can contain
     pub fn capacity(&self) -> usize {
-        self.inner.contents.capacity()
+        self.inner.capacity()
     }
 
+    /// returns current number of elements in the queue
     pub fn size(&self) -> usize {
-        let head = self.inner.head.load(Acquire);
-        let tail = self.inner.tail.load(Acquire);
-        tail.wrapping_sub(head)
+        self.inner.size()
+    }
+
+    /// returns true if the queue is full, false otherwise
+    pub fn is_full(&self) -> bool {
+        self.inner.is_full()
+    }
+
+    /// returns true if the queue is empty, false otherwise
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }
 
@@ -144,54 +354,40 @@ impl<T> SpmcQueueConsumer<T> {
         Self { inner }
     }
 
-    #[inline]
-    fn load(&self, head: usize) -> T {
-        let idx = head % self.inner.contents.capacity();
-        let contents = self.inner.contents.as_ptr();
-        fence(Acquire);
-        unsafe { core::ptr::read(contents.add(idx)) }
-    }
-
-    #[inline]
-    fn confirm(&self, head: usize, result: T) -> Result<T, usize> {
-        match self
-            .inner
-            .head
-            .compare_exchange(head, head.wrapping_add(1), AcqRel, Acquire)
-        {
-            Ok(_) => Ok(result),
-            Err(x) => {
-                core::mem::forget(result);
-                Err(x)
-            }
-        }
-    }
-
+    /// Pops an element from the head of the queue
+    ///
+    /// This operation is lock-free.
+    ///
+    /// ## Example:
+    ///
+    /// ```
+    /// # use spmc_queue::SpmcQueue;
+    /// let mut queue = SpmcQueue::new();
+    /// queue.push(1).unwrap();
+    /// queue.push(2).unwrap();
+    ///
+    /// let consumer = queue.to_consumer();
+    /// assert_eq!(consumer.pop(), Some(1));
+    /// assert_eq!(consumer.pop(), Some(2));
+    /// assert_eq!(consumer.pop(), None);
+    /// ```
     pub fn pop(&self) -> Option<T> {
-        let inner = &self.inner;
-        let mut head = inner.head.load(Acquire);
-
-        loop {
-            let tail = inner.tail.load(Acquire);
-            if tail == head {
-                return None;
-            }
-            let result = self.load(head);
-            match self.confirm(head, result) {
-                Ok(x) => return Some(x),
-                Err(h) => head = h,
-            }
-        }
+        self.inner.pop()
     }
 
+    /// returns current number of elements in the queue
     pub fn size(&self) -> usize {
-        let head = self.inner.head.load(Acquire);
-        let tail = self.inner.tail.load(Acquire);
-        tail.wrapping_sub(head)
+        self.inner.size()
     }
 
+    /// returns maximum number of elements the queue can contain
     pub fn capacity(&self) -> usize {
-        self.inner.contents.capacity()
+        self.inner.capacity()
+    }
+
+    /// returns true if the queue is empty, false otherwise
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }
 
@@ -223,7 +419,7 @@ mod tests {
         let mut p = SpmcQueue::default();
         let c = p.to_consumer();
         for i in 0..10 {
-            p.push(i);
+            p.push(i).unwrap();
         }
         let mut r = 0;
         while let Some(i) = c.pop() {
@@ -239,14 +435,23 @@ mod tests {
         let c = p.to_consumer();
 
         assert_eq!(c.size(), 0);
-        assert!(p.push(5));
+        assert!(c.is_empty());
+        assert!(p.is_empty());
+        assert!(!p.is_full());
+
+        p.push(5).unwrap();
+
         assert_eq!(c.size(), 1);
+        assert!(!c.is_empty());
+        assert!(!p.is_empty());
+        assert!(!p.is_full());
+
         assert_eq!(c.pop(), Some(5));
         assert_eq!(c.size(), 0);
         assert!(c.pop().is_none());
 
         for i in 0..n {
-            assert!(p.push(i));
+            p.push(i).unwrap();
             assert_eq!(c.size(), i + 1);
         }
 
@@ -272,11 +477,11 @@ mod tests {
     fn single_thread_box() {
         let mut p = SpmcQueue::new();
         let c = p.to_consumer();
-        assert!(p.push(Box::new(5)));
+        p.push(Box::new(5)).unwrap();
         assert_eq!(c.pop(), Some(Box::new(5)));
         assert!(c.pop().is_none());
         let c2 = c.clone();
-        assert!(p.push(Box::new(42)));
+        p.push(Box::new(42)).unwrap();
         assert_eq!(c2.pop(), Some(Box::new(42)));
         assert!(c.pop().is_none());
     }
@@ -285,11 +490,17 @@ mod tests {
     fn no_consumers_test() {
         let ctr = Arc::new(AtomicUsize::new(0));
         let mut p = SpmcQueue::default();
+        assert!(p.is_empty());
+        assert!(!p.is_full());
         for i in 0..p.capacity() {
-            assert!(p.push(DropTest::new(&ctr)));
+            assert!(!p.is_full());
+            p.push(DropTest::new(&ctr)).unwrap();
             assert_eq!(ctr.load(Relaxed), i + 1);
+            assert!(!p.is_empty());
         }
-        assert!(!p.push(DropTest::new(&ctr)));
+        assert!(p.push(DropTest::new(&ctr)).is_err());
+        assert!(!p.is_empty());
+        assert!(p.is_full());
         core::mem::drop(p);
         assert_eq!(ctr.load(Relaxed), 0);
     }
@@ -319,7 +530,7 @@ mod tests {
         let ctr = Arc::new(AtomicUsize::new(0));
         let mut p = SpmcQueue::with_capacity(128);
         let c = p.to_consumer();
-        assert!(p.push(DropTest::new(&ctr)));
+        p.push(DropTest::new(&ctr)).unwrap();
         c.pop().unwrap();
         assert!(c.pop().is_none());
         core::mem::drop(p);
@@ -334,17 +545,17 @@ mod tests {
         let c2 = c1.clone();
 
         let ctr = Arc::new(AtomicUsize::new(0));
-        assert!(p.push(DropTest::new(&ctr)));
+        p.push(DropTest::new(&ctr)).unwrap();
         let head = p.inner.head.load(Relaxed);
 
         /* Simulate race condition, when 2 different
          * consumers load the same value, then try to confirm it.
          * Only one should succeed */
-        let r1 = c1.load(head);
-        let r2 = c2.load(head);
+        let r1 = c1.inner.load(head);
+        let r2 = c2.inner.load(head);
 
-        let con1 = c1.confirm(head, r1);
-        let con2 = c2.confirm(head, r2);
+        let con1 = c1.inner.confirm(head, r1);
+        let con2 = c2.inner.confirm(head, r2);
 
         /* only first confirmation succeeds */
         assert!(con1.is_ok());
@@ -371,7 +582,7 @@ mod tests {
                             r_ctr.fetch_add(1, Relaxed);
                         }
                         None => {
-                            std::thread::yield_now();
+                            thread::yield_now();
                         }
                     }
                 }
@@ -383,8 +594,8 @@ mod tests {
             let mut i = 0;
             while i < n {
                 match p.push(DropTest::new(&producer_ctr)) {
-                    false => std::thread::yield_now(),
-                    true => i += 1,
+                    Err(_) => thread::yield_now(),
+                    Ok(()) => i += 1,
                 };
             }
         });

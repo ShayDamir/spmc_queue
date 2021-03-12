@@ -6,7 +6,7 @@ fn single_thread_bench(c: &mut Criterion) {
     let consumer = producer.to_consumer();
     c.bench_function("single", |b| {
         b.iter(|| {
-            producer.push(black_box(20));
+            producer.push(black_box(20)).unwrap();
             consumer.pop().unwrap();
         })
     });
