@@ -15,3 +15,6 @@ criterion = "0.3"
 [[bench]]
 name = "spmc_bench"
 harness = false
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.4"

@@ -48,9 +48,21 @@
 //! ```
 
 use core::fmt;
-use core::sync::atomic::fence;
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+
+#[cfg(not(loom))]
+use core::sync::atomic::{
+    fence, AtomicUsize,
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
+};
+#[cfg(loom)]
+use loom::sync::{
+    atomic::{
+        fence, AtomicUsize,
+        Ordering::{AcqRel, Acquire, Relaxed, Release},
+    },
+    Arc,
+};
+#[cfg(not(loom))]
 use std::sync::Arc;
 
 struct SpmcQueueInner<T> {
@@ -92,7 +104,6 @@ impl<T> SpmcQueueInner<T> {
         unsafe {
             core::ptr::write(contents.add(idx), item);
         }
-        fence(Release);
         self.tail.store(tail.wrapping_add(1), Release);
         Ok(())
     }
@@ -509,8 +520,11 @@ mod tests {
     fn fmt_test() {
         let p: SpmcQueue<usize> = SpmcQueue::with_capacity(64);
         let c = p.to_consumer();
+        let ctr = Arc::new(AtomicUsize::new(0));
+        let d = DropTest::new(&ctr);
+
         println!("Display: {} {}", p, c);
-        println!("Debug: {:?} {:?}", p, c);
+        println!("Debug: {:?} {:?} {:?}", p, c, d);
     }
 
     #[test]
@@ -605,5 +619,30 @@ mod tests {
         producer_handle.join().unwrap();
         assert_eq!(drop_ctr.load(Relaxed), 0);
         assert_eq!(recv_ctr.load(Relaxed), n);
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_2_consumer_test() {
+        loom::model(move || {
+            let mut queue = SpmcQueue::new();
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let c = queue.to_consumer();
+                handles.push(loom::thread::spawn(move || {
+                    if let Some(item) = c.pop() {
+                        assert_eq!(item, 1);
+                    }
+                }));
+            }
+            handles.push(loom::thread::spawn(move || {
+                for _ in 0..3 {
+                    queue.push(1).unwrap();
+                }
+            }));
+            for t in handles {
+                t.join().unwrap();
+            }
+        });
     }
 }

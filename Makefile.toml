@@ -2,10 +2,16 @@
 command = "cargo"
 args = ["criterion"]
 
-[tasks.check]
-# Runs before commit
+[tasks.commit-flow]
+# Run before commit
 dependencies = [
+	"clippy-flow",
 	"dev-test-flow",
 	"coverage-flow",
 	"criterion"
 ]
+
+[tasks.loom]
+command = "cargo"
+env = {"LOOM_MAX_PREEMPTIONS" = "22", "RUSTFLAGS" = "--cfg loom" }
+args = ["test", "--release", "loom"]
