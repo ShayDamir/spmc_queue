@@ -2,6 +2,7 @@ name: CI
 on: [push, pull_request]
 env:
   CLICOLOR_FORCE: 1
+  CARGO_MAKE_RUN_CODECOV: true
 jobs:
   ci:
     name: CI
@@ -21,10 +22,7 @@ jobs:
         profile: minimal
         override: true
     - name: Install cargo-make
-      uses: actions-rs/cargo@v1
-      with:
-        command: install
-        args: --debug cargo-make
+      uses: davidB/rust-cargo-make@v1
     - name: Run CI
       if: matrix.rust != 'nightly'
       uses: actions-rs/cargo@v1
